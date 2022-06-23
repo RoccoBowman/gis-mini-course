@@ -1,0 +1,372 @@
+---
+title: "Practical 3: Basics of Spatial Statistics"
+author: "Rocco Bowman"
+date: "6/3/2021"
+output: 
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:/Users/bowma/Desktop/GIS Mini-course Summer 2021")
+getwd()
+```
+
+## 3.0 Introduction
+
+While we can always map data, overlay them, and even do some analysis, there are more precise ways in which to investigate and describe spatial relationships and distributions. This is the realm of spatial statistics or statistics with space in mind. Spatial statistics uses mathematics and geometry to describe spatial relationships rather than relying only on inductive visualization. 
+
+In this lesson, we will be using some new packages and object types. The **spdep** package is the most commonly used package for investigating spatial dependency while **rgdal** is a widely-used package for GIS-like operations. Sort of hidden in there is the **sp** package which actually subsumes these and other packages.
+
+## 3.1 Nearest Neighbors and Spatial Adjacency
+
+As we briefly saw in the slide show, spatial dependency should be taken into account when dealing with spatial data as data points near each other should, by default, be expected to be dependent on nearby data points. If we try to correlate data only based on tabular rows without accounting for spatial dependence, we might get a spurious result.
+
+THe first step we can take to understanding the spatial relationships of our data is to create a network of neighbors. First we should load in our required packages and our data. This time we will use **rgdal** to load our data using **readOGR**.
+
+```{r message=FALSE, warning=FALSE}
+library(spdep)
+library(rgdal)
+
+baltimore <- readOGR("Day 3/data/baltimore_neighborhoods.shp")
+```
+
+Next, we generate a neighbor network using **poly2nb** or "polygon to neighbors". This creates a list of neighbors for each polygon in our Baltimore boundaries shapefile of object **nb**. If we set the **queen =** argument to **FALSE** we will get a "rook case" network where only neighbors on the north, east, south, and west are accounted for.
+
+We can also assign the corrdinates of the relative centroids of each polygon with **coordinates**. This makes plotting the network easier as we can see each node.
+
+```{r}
+rook <- poly2nb(baltimore, queen = FALSE)
+xy <- coordinates(baltimore)
+class(rook)
+summary(rook)
+
+plot(baltimore, col='gray', border='black', lwd=2)
+plot(rook, xy, col='red', lwd=2, add=TRUE)
+```
+
+If we set the **queen =** argument to true then we get the "queen case" where diagonal neighbors are accounted for. In this case, the difference is small since Baltimore is very square-shaped, but inspecting the summary of **w** shows that there is a difference in non-zero weights and the maximum number of links went up a bit. Keep in mind that using this method, polygons have different numbers of neighbors which might skew the results. We can view this under "Link number distribution" in the summary output.
+
+```{r}
+queen <- poly2nb(baltimore, queen = TRUE)
+xy <- coordinates(baltimore)
+class(queen)
+summary(queen)
+
+plot(baltimore, col='gray', border='black', lwd=2)
+plot(queen, xy, col='red', lwd=2, add=TRUE)
+```
+There are other ways to determine which polygons are neighbors to each other.For example, **k nearest neighbors** allows you to determine how many neighbors each polygon should have which ensures that each has the same number of neighbors thereby accounting for any edge effects.
+
+We can get k nearest neighbors by calling **knearneigh** and supplying the coordinates for our shapefile as well as the number we want for **k** or number of neighbors. However, we need to convert the resulting object to an **nb** list object like before in order to visualize it.
+```{r}
+coords <- coordinates(baltimore)
+knn <- knearneigh(coords, k = 1)
+knn_nb <- knn2nb(knn)
+plot(baltimore, border="grey")
+plot(knn_nb, coords,col='red', lwd=2, add=TRUE)
+```
+
+With only one neighbor (k=1), we can see that the network is rather disjointed; k should be greater than one. We can simply set k to something like 4...
+
+```{r}
+coords <- coordinates(baltimore)
+knn <- knearneigh(coords, k = 8)
+knn_nb <- knn2nb(knn)
+plot(baltimore, border="grey")
+plot(knn_nb, coords,col='red', lwd=2, add=TRUE)
+```
+
+## 3.2 Spatial Autocorrelation, Spatial Lag, and Moran's *I*
+The most common statistic used to describe spatial autocorrelation ---how clustered like values are in space--- is Moran's *I*. The calculation depends on a neighborhood matrix either nearest neighbors, distance-based, or weighted. In essence, each feature will be compared to its declared neighbors; if many similar values occur adjacent to each other, it increases the value of the statistic.
+
+First, we will calculate Moran's *I* the long way including computing lags, running Monte Carlo simulations to test our current distribution against random permutations for significance, and calculating an adequate *p* value.
+
+First, we turn our k nearest neighbors matrix into a weight list using **nb2listw**. We can quickly check the weights given to each neighbor by calling the connections of the first polygon with **lw$weights[1]**. We see that each weight to the four (k=4) neighbors is equal, adding up to 1.
+
+```{r}
+lw <- nb2listw(knn_nb, style="W", zero.policy = TRUE)
+lw$weights[1]
+```
+
+Next, we will compute the lags for each polygon and its neighbors using our weight list and the our variable: population density. The result will be an average density for the spatial neighborhood of each city neighborhood; that is, the average density around each polygon.
+
+```{r}
+library(tidyverse)
+
+density_lag <- lag.listw(lw, baltimore@data$pop_dens)
+table <- tibble(neighborhood = baltimore@data$name, density = density_lag)
+table
+```
+Next, we can fit a linear model to the raw variable values and the lagged neighborhood values. The resulting coefficient in our *I* statistic.
+```{r}
+# Create a regression model
+regression <- lm(density_lag ~ baltimore@data$pop_dens)
+
+coef(regression)[2]
+
+# Plot the data
+plot(density_lag ~ baltimore@data$pop_dens)
+abline(regression, col ="red")
+
+```
+However, we still need to test if the slope is significantly different than *zero* autocorrelation or **Complete Spatial Randomness**. We can test the observed slope against many random permutations of the data.
+
+```{r}
+nsims <- 999
+all_coef <- vector(length=nsims)  # Create an empty vector
+
+for (i in 1:nsims){
+  # Randomly shuffle income values
+  x <- sample(baltimore$pop_dens, replace=FALSE)
+  # Compute new set of lagged values
+  xlag <- lag.listw(lw, x)
+  # Compute the regression slope and store its value
+  temp_model <- lm(density_lag ~ x)
+  all_coef[i] <- coef(temp_model)[2]
+}
+
+# Plot the histogram of simulated Moran's I values
+# then add our observed Moran's I value to the plot
+hist(all_coef, xlab="Moran's I", breaks = seq(-0.20,0.25,0.05))
+abline(v=coef(regression)[2], col="red")
+```
+
+We lastly should calculate the number of simulated Moran's I values greater than the observed one. We get a weird number likely because it is impossible to get a greater one even with simulation. This is to be expected since population density is very clustered!
+
+```{r}
+n_greater <- sum(coef(regression)[2] > all_coef)
+p <- min(n_greater + 1, nsims + 1 - n_greater) / (nsims + 1)
+p
+```
+
+Luckly, R makes things easy with built-in functions that bypass the need for large chunks of code. Simply use **moran.test** with your variable and list weights to get a nice summary. Our Moran I statistic is similar to what we got the long way.
+
+```{r}
+moran_test <- moran.test(baltimore$pop_dens,lw)
+moran_test
+```
+We can also duplicate the Monte Carlo tests combined with the Moran test which yields a similar statistic.
+
+```{r}
+MC<- moran.mc(baltimore$pop_dens, lw, nsim=999)
+MC
+```
+
+Lastly, we can plot the observed statistic against the simulations to see just how significant our spatial autocorrelation is!
+
+```{r}
+plot(MC, main="", las=1)
+```
+
+You might also want to take a look at your Moran's I scatter plot to examine which data points belong to which quadrants. We can extract the Moran's I stat to make the title. Lastly, we can call **moran.plot** and insert our data of interest along with our weights matrix.
+
+```{r}
+moran_i <- round(moran_test[["estimate"]][["Moran I statistic"]],2)
+
+moran.plot(baltimore@data$pop_dens, lw,
+           xlab = "Population Density",
+           ylab = "Lagged Population Density",
+           main = paste0("Moran's I: ", moran_i),
+           labels = baltimore@data$name, col = "purple", pch = 19)
+```
+
+
+## 3.3 Local Indicators of Spatial Association
+Moran's I is useful but is often too broad to be meaningful in analysis. Instead, we can use LISA to break down the global into local indicators and find where clusters of like values are located.
+
+We will use the **rgeoda** package for this, which makes a LISA analysis much easier to perform. First we need to create a spatial weights matrix with **queen_weights**. You can also use **rook_weights** and **knn_weights**. Since **rgeoda** uses sf objects, we will convert **baltimore** to one using **as(X,"sf")**.
+
+```{r}
+#install.packages("rgeoda")
+library(rgeoda)
+
+baltimore_sf <- as(baltimore, "sf")
+w <- knn_weights(baltimore_sf, k = 8)
+
+summary(w)
+```
+By reading the summary of our weights matrix, we can see that it has **isolates**! These are polygons or other features that do not have a neighbor in the matrix which can cause problems in further analysis. Because the queens case is based on contiguity, the detached polygon of Hawkins Point is excluded. Instead, let's use a distance threshold by calculating the minimum threshold with **min_distthreshold**.
+
+```{r}
+knn_w <- knn_weights(baltimore_sf, k = 8)
+
+dist_thres <- min_distthreshold(baltimore_sf)
+dist_thres
+
+dist_w <- distance_weights(baltimore_sf, dist_thres)
+
+summary(dist_w)
+```
+
+Now that we have no isolates, we need to perform the calculation of Moran's *I* and LISA calculation using **local_moran** and feeding it the weights matrix and our shapefile plus one or more variables. In this case, we are going to use the **age65ovr** variable to find out where older people live.
+
+We can also skip the Monte Carlo step from above by telling **R** to run permutations.
+
+```{r}
+lisa <- local_moran(dist_w, baltimore_sf["occ_own"], permutations = 599)
+```
+
+Plotting the map of the local indicators is not, however, *that* easy and there is no direct way to do it with **rgeoda**. What we can do, though, is to reattach the LISA results to our shapefile and plot from there with a customized color palette to show the appropriate cluster colors.
+
+```{r}
+lisa_info <- tibble(fid = baltimore_sf$fid, cluster = lisa$c_vals, p_vals = lisa$p_vals)
+
+shape <- baltimore_sf %>%
+  left_join(lisa_info)
+
+shape$cluster[shape$cluster == 0] = "Not significant"
+shape$cluster[shape$cluster == 1] = "High-High"
+shape$cluster[shape$cluster == 2] = "Low-Low"
+shape$cluster[shape$cluster == 3] = "Low-High"
+shape$cluster[shape$cluster == 4] = "High-Low"
+
+shape$cluster <- factor(shape$cluster,
+                       levels=c("Not significant", "High-High", "Low-Low","Low-High","High-Low","Neighborless"))
+
+lisa_colors <- lisa_colors(lisa)
+
+ggplot() +
+  geom_sf(data = shape, aes(fill = cluster)) +
+  scale_fill_manual(values = lisa_colors) +
+  ggtitle("Residences Owned and Occupied in Baltimore") +
+  theme_void()
+```
+We see that the northern corners of Baltimore seem to have the most common numbers of older residents with pockets here and there (in light red). This is significantly different from a choropleth map in that neighborhoods count more than just the values within each feature.
+
+We can also see the p-values per feature
+
+```{r}
+ggplot() +
+  geom_sf(data = shape, aes(fill = p_vals)) +
+  scale_fill_continuous(low="darkgreen",high = "white") +
+  ggtitle("P values") +
+  theme_void()
+```
+
+## 3.4 Calculating Distance
+Besides XY coordinates serving as the only potential spatial variable (which technically could be used in purely tabular form), we can also generate new variables by calculating distance from a given point. In this case, we can calculate the distance of each neighborhood from Downtown in the center of Baltimore. First, we will make a new object of only the Downtown neighborhood to act as the shapefile that all others will be compared against.
+
+Due to the **baltimore** shapefile being a an **sp** object, we can't use **dplyr** to subset it right out of the box. We can use the base **R** method or we can first convert it to an **sf** object using **as(X, "sf")** and then use **dplyr's** filter function.
+
+```{r}
+dt <- baltimore[baltimore$name =="Downtown",]
+
+dt2 <- as(baltimore, "sf") %>% 
+  filter(name == "Downtown")
+```
+
+We will use the same trick to calculate distances easily in the **sf** package using **st_distance**.
+
+```{r}
+library(sf)
+
+# Compute Distances and Store as Variables for Regression
+dist_dt <- st_distance(as(baltimore, "sf"), as(dt2, "sf"))
+
+head(dist_dt)
+class(dist_dt)
+```
+
+If we take a look at the summary, we can see that **dist** is a vector of distances for each polygon to the edge of the downtown neighborhood. Also notice that the type of **dist** is "units" and is not a simple list. These units reflect our projection. However, as long as we know that the distances are measured in units, we can convert these values to numeric so that we can more easily plot and manipulate them.
+
+```{r}
+dist_num <- as.numeric(dist_dt)
+```
+
+Again, we need to do some conversion to make the baltimore **sp** object useful within the **ggplot** framework. This requires we either fortify it using **fortify** or convert it to an sf object. SF is easier to work with and requires little code, so we will go with that. In addition, we can use **mutate** to add a new column for our distance calculations.
+
+```{r}
+library(tidyverse)
+library(broom)
+
+baltimore_sf <- st_as_sf(baltimore) %>%
+  mutate(dist = dist_num)
+
+ggplot() +
+  geom_sf(data=baltimore_sf, aes(fill = dist))+
+  scale_fill_continuous(low = "white",high = "red") +
+  geom_sf(data = baltimore_sf %>% filter(name == "Downtown"),fill = "blue")
+```
+The results are what we expect. Neighborhoods farther away from the central Downtown neighborhood have higher distances.Let's look at a map of population density as well before we move on to a regression.
+
+```{r}
+ggplot() +
+geom_sf(data=baltimore_sf,
+          aes(fill = pop_dens),
+          color="black", size = 0.2) +
+  scale_fill_continuous(low = "white",high = "red")
+```
+
+## 3.5 Spatially-Weighted Regression
+Spatially-weighted Regression (GWR) is a type of regression that performs a regression on each local neighborhood as designated by a spatial weight matrix. Normal regression can take XY coordinates into account but cannot explicitly account for spatial relationships and spatial dependence. In other words, a GWR can help answer the question: "Is the relationship between variable X and variable Y consistent *across* the study area?"
+
+We will run a normal linear regression on two variables, then feed the same into a GWR and plot the results. For this first task, we will focus on the relationship between distance from downtown and population density.
+
+```{r}
+model <- lm(baltimore_sf$pop_dens ~ baltimore_sf$dist)
+summary(model)
+
+resids<-residuals(model)
+```
+
+Before continuing we should examine the diagnostic plots for our linear regression to make sure it fits the assumptions of a linear model.
+
+* **Residuals vs Fitted** No obvious pattern emerges which means there isn't likely to be an underlying structure to the residuals
+* **Normal Q-Q** Standardized residuals are mostly along the line which means the dependent variable is (mostly) normal
+* **Scale-Location** Points are evenly and randomly distributed along the line which means the residuals are homoscedastic
+* **Residuals vs Leverage** We can't even see the Cook's distance lines so there are no influential cases/ outliers
+
+```{r}
+plot(model)
+```
+
+Now we can use the **spgwr** package to set up a spatially-weighted regression. First, we join the distance calculation we made earlier to the original baltimore shapefile. Because this package is based on **sp** it is easier to perform the regression on such an object. Next, we determine a bandwidth or the radius of search. By entering "true" into the **adapt** argument, we are telling the algorithm to test different distances and choose an ideal one.
+
+```{r}
+library(spgwr)
+
+baltimore@data$dist <- baltimore_sf$dist
+
+spTransform(baltimore, CRS("+init=epsg:26785"))
+
+GWRbandwidth <- gwr.sel(pop_dens ~ dist, data=baltimore ,adapt=TRUE)
+```
+
+Now we can run our gwr model with our adaptive bandwidth equal to the one we generated. The output is very complicated but our quasi-global R-squared is similar to the standard regression.
+
+```{r}
+gwr.model = gwr(pop_dens ~ dist, data=baltimore, adapt=GWRbandwidth, hatmatrix=TRUE, se.fit=TRUE)
+
+#print the results of the model
+gwr.model
+```
+
+Now we can join the results stored in our sp object in our sf object for plotting.
+
+```{r}
+results<-as.data.frame(gwr.model$SDF)
+
+shape <- baltimore_sf %>%
+  mutate(gwr_resids = results$dist)
+```
+
+Using ggplot, we can see how the relationship between distance and population density differ across space. If we plot the raw population values, we can see that perhaps the eastern part of Baltimore breaks what we would think is a smooth transition from suburbs to downtown.
+
+```{r}
+ggplot()+
+geom_sf(data=shape,
+          aes(fill = gwr_resids),
+          color="black", size = 0.2) +
+  scale_fill_continuous(low = "white",high = "red")
+```
+**Now you can try different variables and see what results you get from a GWR!**
+
+## Conclusion
+There is still much to exhibit about GWR but it exceeds the scope of this lesson (and my abilities at the moment). However, we have seen that we can make accommodations for spatial relationships, create spatial variables, and run spatial regressions. In the next lesson we will explore more spatial relationships in the form of cluster algorithms using spatial weights.
+
+The **rgeoda** package has many more useful functions and you can find a tutorial for nearly all of them [here](https://geodacenter.github.io/rgeoda/articles/rgeoda_tutorial.html)
+
+You can also find the standalone GeoDa software with many more functions and a point-and-click interface [here](https://geodacenter.github.io/download.html)
